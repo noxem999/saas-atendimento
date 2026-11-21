@@ -5,6 +5,8 @@ const path = require('path');
 const fs = require('fs');
 const QRCode = require('qrcode');
 const pino = require('pino');
+const GroqModule = require('groq-sdk');
+const Groq = GroqModule.default || GroqModule;
 const {
   default: makeWASocket,
   useMultiFileAuthState,
@@ -145,6 +147,56 @@ app.get('/api/agendamentos', autenticar, (req, res) => {
   res.json(agendamentos);
 });
 
+// ---------- Robô de atendimento (IA / Groq) ----------
+const GROQ_API_KEY = process.env.GROQ_API_KEY;
+const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
+const SYSTEM_PROMPT =
+  process.env.BOT_SYSTEM_PROMPT ||
+  'Você é um atendente virtual educado. Responda de forma curta, clara e em português do Brasil.';
+
+// Sem a chave, o servidor funciona normalmente, só que o robô fica desligado.
+const groq = GROQ_API_KEY ? new Groq({ apiKey: GROQ_API_KEY }) : null;
+if (!groq) {
+  console.warn('AVISO: GROQ_API_KEY não definida. O robô de atendimento está desligado.');
+}
+
+// Histórico curto por cliente (em memória) para a IA entender o contexto da conversa
+const historicos = new Map();
+const MAX_MENSAGENS_HISTORICO = 10;
+const MAX_CONVERSAS_EM_MEMORIA = 500;
+
+async function gerarRespostaIA(jid, textoCliente) {
+  const historico = historicos.get(jid) || [];
+  historico.push({ role: 'user', content: textoCliente });
+  while (historico.length > MAX_MENSAGENS_HISTORICO) historico.shift();
+
+  try {
+    const completion = await groq.chat.completions.create({
+      model: GROQ_MODEL,
+      messages: [{ role: 'system', content: SYSTEM_PROMPT }, ...historico],
+      temperature: 0.6,
+      max_tokens: 300,
+    });
+
+    const resposta = completion.choices?.[0]?.message?.content?.trim();
+    if (resposta) {
+      historico.push({ role: 'assistant', content: resposta });
+      while (historico.length > MAX_MENSAGENS_HISTORICO) historico.shift();
+    }
+
+    // Evita crescer sem limite: descarta a conversa mais antiga
+    if (!historicos.has(jid) && historicos.size >= MAX_CONVERSAS_EM_MEMORIA) {
+      historicos.delete(historicos.keys().next().value);
+    }
+    historicos.set(jid, historico);
+
+    return resposta;
+  } catch (err) {
+    historico.pop(); // remove a pergunta que ficou sem resposta
+    throw err;
+  }
+}
+
 // ---------- WhatsApp (Baileys) ----------
 // Sessão do WhatsApp (não versionar!). No Render, aponte WHATSAPP_AUTH_DIR para um disco persistente
 // (ex.: /data/auth_whatsapp); sem isso a sessão se perde a cada deploy/reinício.
@@ -170,6 +222,40 @@ async function iniciarWhatsApp() {
     });
 
     sock.ev.on('creds.update', saveCreds);
+
+    // Mensagens recebidas: responde com a IA
+    sock.ev.on('messages.upsert', async ({ messages, type }) => {
+      if (type !== 'notify' || !groq) return;
+
+      for (const msg of messages) {
+        try {
+          // Ignora o que você mesmo enviou e mensagens sem conteúdo
+          if (!msg.message || msg.key.fromMe) continue;
+
+          // Ignora grupos e status
+          const jid = msg.key.remoteJid;
+          if (!jid || jid.endsWith('@g.us') || jid.endsWith('@broadcast')) continue;
+
+          // Ignora mensagens antigas (acumuladas enquanto o servidor estava fora do ar)
+          const ts = Number(msg.messageTimestamp?.toNumber?.() ?? msg.messageTimestamp ?? 0);
+          if (ts > 0 && Date.now() / 1000 - ts > 300) continue;
+
+          // Só mensagens de texto
+          const texto = msg.message.conversation || msg.message.extendedTextMessage?.text;
+          if (!texto || !texto.trim()) continue;
+
+          await sock.sendPresenceUpdate('composing', jid); // "digitando..."
+          const resposta = await gerarRespostaIA(jid, texto.trim());
+          await sock.sendPresenceUpdate('paused', jid);
+
+          if (resposta) {
+            await sock.sendMessage(jid, { text: resposta });
+          }
+        } catch (err) {
+          console.error('Erro ao responder mensagem:', err.message);
+        }
+      }
+    });
 
     sock.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect, qr } = update;
