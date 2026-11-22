@@ -158,6 +158,8 @@ const SYSTEM_PROMPT =
 const groq = GROQ_API_KEY ? new Groq({ apiKey: GROQ_API_KEY }) : null;
 if (!groq) {
   console.warn('AVISO: GROQ_API_KEY não definida. O robô de atendimento está desligado.');
+} else {
+  console.log(`Robô de atendimento LIGADO (modelo: ${GROQ_MODEL}).`);
 }
 
 // Histórico curto por cliente (em memória) para a IA entender o contexto da conversa
@@ -225,34 +227,73 @@ async function iniciarWhatsApp() {
 
     // Mensagens recebidas: responde com a IA
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
-      if (type !== 'notify' || !groq) return;
+      console.log(`[bot] messages.upsert recebido (type=${type}, qtd=${messages.length})`);
+
+      if (type !== 'notify') {
+        console.log(`[bot] ignorado: type "${type}" (só respondo "notify")`);
+        return;
+      }
+      if (!groq) {
+        console.log('[bot] ignorado: GROQ_API_KEY não está definida, o robô está desligado.');
+        return;
+      }
 
       for (const msg of messages) {
         try {
-          // Ignora o que você mesmo enviou e mensagens sem conteúdo
-          if (!msg.message || msg.key.fromMe) continue;
+          const jid = msg.key?.remoteJid;
 
-          // Ignora grupos e status
-          const jid = msg.key.remoteJid;
-          if (!jid || jid.endsWith('@g.us') || jid.endsWith('@broadcast')) continue;
+          if (!msg.message) {
+            console.log(`[bot] ignorado (${jid}): mensagem sem conteúdo (pode estar descriptografando).`);
+            continue;
+          }
+          if (msg.key.fromMe) {
+            console.log(`[bot] ignorado (${jid}): mensagem enviada por mim mesmo (fromMe).`);
+            continue;
+          }
+          if (!jid || jid.endsWith('@g.us') || jid.endsWith('@broadcast')) {
+            console.log(`[bot] ignorado (${jid}): grupo ou status.`);
+            continue;
+          }
 
           // Ignora mensagens antigas (acumuladas enquanto o servidor estava fora do ar)
           const ts = Number(msg.messageTimestamp?.toNumber?.() ?? msg.messageTimestamp ?? 0);
-          if (ts > 0 && Date.now() / 1000 - ts > 300) continue;
+          if (ts > 0 && Date.now() / 1000 - ts > 300) {
+            console.log(`[bot] ignorado (${jid}): mensagem antiga.`);
+            continue;
+          }
+
+          // Desembrulha mensagens temporárias / de visualização única
+          const conteudo =
+            msg.message.ephemeralMessage?.message ||
+            msg.message.viewOnceMessage?.message ||
+            msg.message.viewOnceMessageV2?.message ||
+            msg.message.documentWithCaptionMessage?.message ||
+            msg.message;
 
           // Só mensagens de texto
-          const texto = msg.message.conversation || msg.message.extendedTextMessage?.text;
-          if (!texto || !texto.trim()) continue;
+          const texto = conteudo.conversation || conteudo.extendedTextMessage?.text;
+          if (!texto || !texto.trim()) {
+            console.log(`[bot] ignorado (${jid}): não é texto (tipos: ${Object.keys(conteudo).join(', ')}).`);
+            continue;
+          }
+
+          console.log(`[bot] mensagem de ${jid}: "${texto.trim().slice(0, 80)}"`);
 
           await sock.sendPresenceUpdate('composing', jid); // "digitando..."
           const resposta = await gerarRespostaIA(jid, texto.trim());
           await sock.sendPresenceUpdate('paused', jid);
 
-          if (resposta) {
-            await sock.sendMessage(jid, { text: resposta });
+          if (!resposta) {
+            console.log('[bot] a IA retornou uma resposta vazia.');
+            continue;
           }
+
+          await sock.sendMessage(jid, { text: resposta });
+          console.log(`[bot] resposta enviada para ${jid}.`);
         } catch (err) {
-          console.error('Erro ao responder mensagem:', err.message);
+          console.error(
+            `[bot] ERRO ao responder (status=${err.status ?? 'n/a'}): ${err.message}`
+          );
         }
       }
     });
