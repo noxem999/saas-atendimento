@@ -136,23 +136,182 @@ app.get('/api/painel', autenticar, (req, res) => {
   });
 });
 
-// ---------- Agendamentos (dados simulados em memória) ----------
-const agendamentos = [
-  { id: 1, cliente: 'João', servico: 'Corte', horario: '14:00' },
-  { id: 2, cliente: 'Maria', servico: 'Escova', horario: '15:30' },
-  { id: 3, cliente: 'Carlos', servico: 'Barba', horario: '16:45' },
-];
+// ---------- Agendamentos ----------
+// Ficam em memória e também são gravados em um arquivo JSON, para sobreviverem a reinícios.
+// No Render, aponte DATA_DIR para um disco persistente (ex.: /data); sem isso o arquivo some a cada deploy.
+const DATA_DIR = process.env.DATA_DIR || __dirname;
+const ARQUIVO_AGENDAMENTOS = path.join(DATA_DIR, 'agendamentos.json');
+const FUSO = 'America/Sao_Paulo';
+
+function carregarAgendamentos() {
+  try {
+    const lista = JSON.parse(fs.readFileSync(ARQUIVO_AGENDAMENTOS, 'utf8'));
+    return Array.isArray(lista) ? lista : [];
+  } catch {
+    return [];
+  }
+}
+
+function salvarAgendamentos() {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(ARQUIVO_AGENDAMENTOS, JSON.stringify(agendamentos, null, 2));
+  } catch (err) {
+    console.error('Erro ao salvar agendamentos:', err.message);
+  }
+}
+
+const agendamentos = carregarAgendamentos();
+let proximoAgendamentoId = agendamentos.reduce((maior, a) => Math.max(maior, a.id || 0), 0) + 1;
+
+// Data e hora atuais no fuso do Brasil (o servidor do Render roda em UTC)
+function agoraNoBrasil() {
+  const agora = new Date();
+  return {
+    data: agora.toLocaleDateString('en-CA', { timeZone: FUSO }), // AAAA-MM-DD
+    hora: agora.toLocaleTimeString('pt-BR', { timeZone: FUSO, hour: '2-digit', minute: '2-digit', hour12: false }),
+    diaSemana: agora.toLocaleDateString('pt-BR', { timeZone: FUSO, weekday: 'long' }),
+  };
+}
+
+const dataParaBR = (iso) => iso.split('-').reverse().join('/');
+
+function criarAgendamento(jid, dados) {
+  const cliente = String(dados?.nome || '').trim().slice(0, 80);
+  const servico = String(dados?.servico || '').trim().slice(0, 80);
+  const data = String(dados?.data || '').trim();
+  const horario = String(dados?.horario || '').trim();
+
+  const dataValida =
+    /^\d{4}-\d{2}-\d{2}$/.test(data) && new Date(`${data}T00:00:00Z`).toISOString().slice(0, 10) === data;
+  const horarioValido = /^([01]\d|2[0-3]):[0-5]\d$/.test(horario);
+
+  if (!cliente || !servico || !dataValida || !horarioValido) {
+    return { ok: false, motivo: 'invalido' };
+  }
+
+  const agora = agoraNoBrasil();
+  if (data < agora.data || (data === agora.data && horario <= agora.hora)) {
+    return { ok: false, motivo: 'passado' };
+  }
+
+  if (agendamentos.some((a) => a.data === data && a.horario === horario)) {
+    return { ok: false, motivo: 'ocupado' };
+  }
+
+  const agendamento = {
+    id: proximoAgendamentoId++,
+    cliente,
+    servico,
+    data,
+    horario,
+    contato: jid && jid.endsWith('@s.whatsapp.net') ? jid.split('@')[0] : null,
+    jid: jid || null, // uso interno: o bot usa para lembrar dos agendamentos de cada cliente
+    criadoEm: new Date().toISOString(),
+  };
+  agendamentos.push(agendamento);
+  salvarAgendamentos();
+  return { ok: true, agendamento };
+}
 
 app.get('/api/agendamentos', autenticar, (req, res) => {
-  res.json(agendamentos);
+  const lista = [...agendamentos]
+    .sort((a, b) => `${a.data} ${a.horario}`.localeCompare(`${b.data} ${b.horario}`))
+    .map(({ jid, ...publico }) => publico); // o jid não vai para o painel
+  res.json(lista);
 });
 
 // ---------- Robô de atendimento (IA / Groq) ----------
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
-const SYSTEM_PROMPT =
+
+// Prompt GLOBAL: serve para qualquer empresa. Os dados do negócio vêm das variáveis de ambiente
+// EMPRESA_NOME e EMPRESA_INFO. Se quiser trocar a personalidade inteira, defina BOT_SYSTEM_PROMPT.
+const PROMPT_BASE =
   process.env.BOT_SYSTEM_PROMPT ||
-  'Você é um atendente virtual educado. Responda de forma curta, clara e em português do Brasil.';
+  `Você é o atendente virtual da empresa, atendendo clientes pelo WhatsApp.
+- Seja educado, simpático e objetivo. Escreva em português do Brasil, com mensagens curtas (no máximo 3 frases).
+- Ajude o cliente a tirar dúvidas sobre a empresa e a marcar horário.
+- Use SOMENTE as informações da empresa fornecidas abaixo. Se não souber algo (preço, endereço, prazo, disponibilidade), diga que vai confirmar com a equipe. Nunca invente.
+- Não converse sobre assuntos que não tenham relação com o atendimento da empresa.`;
+
+const EMPRESA_NOME = process.env.EMPRESA_NOME || '';
+const EMPRESA_INFO = process.env.EMPRESA_INFO || '';
+
+const PROTOCOLO_AGENDAMENTO = `AGENDAMENTOS:
+Para marcar um horário você precisa de 4 dados: nome do cliente, serviço, data e horário. Peça o que estiver faltando, de forma curta.
+Quando tiver os 4 dados e o cliente tiver confirmado, escreva sua mensagem de confirmação normalmente e, no FINAL dela, acrescente uma linha exatamente neste formato (o cliente não vê essa linha):
+[[AGENDAR {"nome":"Nome do cliente","servico":"Serviço","data":"AAAA-MM-DD","horario":"HH:MM"}]]
+Regras:
+- Nunca use essa linha antes da confirmação do cliente e nunca com dados inventados ou incompletos.
+- Use apenas datas e horários futuros. Converta expressões como "amanhã" ou "sexta" para a data real usando a data de hoje informada abaixo.
+- Não ofereça horários que estejam na lista de horários ocupados.
+- Para cancelar ou alterar um agendamento, diga ao cliente que você vai avisar a equipe para confirmar.
+- Se o cliente perguntar sobre os horários dele, responda com base nos "agendamentos deste cliente" abaixo.`;
+
+// Monta o prompt completo de cada conversa, com a data de hoje e os agendamentos
+function construirSystemPrompt(jid) {
+  const agora = agoraNoBrasil();
+  const partes = [PROMPT_BASE];
+
+  if (EMPRESA_NOME) partes.push(`Nome da empresa: ${EMPRESA_NOME}`);
+  if (EMPRESA_INFO) partes.push(`Informações da empresa (serviços, preços, horário de funcionamento, endereço):\n${EMPRESA_INFO}`);
+
+  partes.push(PROTOCOLO_AGENDAMENTO);
+  partes.push(`Hoje é ${agora.diaSemana}, ${dataParaBR(agora.data)} (${agora.data}). Agora são ${agora.hora} (horário de Brasília).`);
+
+  const futuros = agendamentos.filter((a) => a.data >= agora.data);
+
+  const doCliente = futuros.filter((a) => a.jid === jid);
+  partes.push(
+    doCliente.length
+      ? `Agendamentos deste cliente:\n${doCliente
+          .map((a) => `- ${dataParaBR(a.data)} às ${a.horario}: ${a.servico} (em nome de ${a.cliente})`)
+          .join('\n')}`
+      : 'Agendamentos deste cliente: nenhum.'
+  );
+
+  // Só data e horário: não revelamos o nome de outros clientes
+  const ocupados = futuros.slice(0, 80).map((a) => `${dataParaBR(a.data)} às ${a.horario}`);
+  partes.push(`Horários já ocupados (não oferecer): ${ocupados.length ? ocupados.join('; ') : 'nenhum.'}`);
+
+  return partes.join('\n\n');
+}
+
+// Procura o comando de agendamento na resposta da IA, registra no painel e limpa o texto
+const REGEX_AGENDAR = /\[\[\s*AGENDAR\s*(\{[\s\S]*?\})\s*\]\]/;
+const REGEX_AGENDAR_QUALQUER = /\[\[\s*AGENDAR[\s\S]*?\]\]/g;
+
+function processarAgendamentoDaResposta(jid, resposta) {
+  const texto = resposta.replace(REGEX_AGENDAR_QUALQUER, '').trim();
+  const achado = resposta.match(REGEX_AGENDAR);
+  if (!achado) return texto;
+
+  let dados;
+  try {
+    dados = JSON.parse(achado[1]);
+  } catch {
+    console.log('[bot] comando de agendamento com JSON inválido.');
+    return texto;
+  }
+
+  const resultado = criarAgendamento(jid, dados);
+
+  if (resultado.ok) {
+    const a = resultado.agendamento;
+    console.log(`[bot] agendamento #${a.id} criado: ${a.cliente}, ${a.servico}, ${a.data} ${a.horario}`);
+    return texto || `Agendamento confirmado: ${a.servico} em ${dataParaBR(a.data)} às ${a.horario}, no nome de ${a.cliente}.`;
+  }
+
+  console.log(`[bot] agendamento recusado (${resultado.motivo}).`);
+  if (resultado.motivo === 'ocupado') {
+    return 'Poxa, esse horário acabou de ser ocupado. Pode escolher outro horário?';
+  }
+  if (resultado.motivo === 'passado') {
+    return 'Esse horário já passou. Pode me passar uma data e um horário futuros?';
+  }
+  return 'Não consegui registrar o agendamento. Pode me confirmar nome, serviço, data e horário?';
+}
 
 // Sem a chave, o servidor funciona normalmente, só que o robô fica desligado.
 const groq = GROQ_API_KEY ? new Groq({ apiKey: GROQ_API_KEY }) : null;
@@ -175,12 +334,13 @@ async function gerarRespostaIA(jid, textoCliente) {
   try {
     const completion = await groq.chat.completions.create({
       model: GROQ_MODEL,
-      messages: [{ role: 'system', content: SYSTEM_PROMPT }, ...historico],
-      temperature: 0.6,
-      max_tokens: 300,
+      messages: [{ role: 'system', content: construirSystemPrompt(jid) }, ...historico],
+      temperature: 0.5,
+      max_tokens: 400,
     });
 
-    const resposta = completion.choices?.[0]?.message?.content?.trim();
+    const respostaBruta = completion.choices?.[0]?.message?.content?.trim() || '';
+    const resposta = respostaBruta ? processarAgendamentoDaResposta(jid, respostaBruta) : '';
     if (resposta) {
       historico.push({ role: 'assistant', content: resposta });
       while (historico.length > MAX_MENSAGENS_HISTORICO) historico.shift();

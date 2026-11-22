@@ -249,6 +249,39 @@
       border-radius: 12px;
     }
     .wa-box .btn { margin-top: 0; max-width: 260px; }
+    .btn-link {
+      display: block;
+      text-align: center;
+      text-decoration: none;
+    }
+
+    /* Abas do painel */
+    .tabs {
+      display: flex;
+      gap: 6px;
+      padding: 4px;
+      margin-bottom: 22px;
+      background: var(--surface-2);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+    }
+    .tab {
+      flex: 1;
+      padding: 10px 12px;
+      border: none;
+      border-radius: 9px;
+      background: transparent;
+      color: var(--muted);
+      font: inherit;
+      font-weight: 600;
+      cursor: pointer;
+      transition: color 0.15s, background 0.15s;
+    }
+    .tab:hover { color: var(--text); }
+    .tab.ativa { background: var(--surface); color: var(--text); box-shadow: 0 0 0 1px var(--line); }
+    .tab:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+    tbody tr.passado td { opacity: 0.5; }
 
     @media (max-width: 480px) {
       .card { padding: 28px 22px; }
@@ -327,8 +360,14 @@
         <div><dt>Conta criada em</dt><dd id="painel-criado">—</dd></div>
       </dl>
 
+      <div class="tabs" role="tablist" aria-label="Seções do painel">
+        <button class="tab ativa" id="tab-agendamentos" data-aba="agendamentos" role="tab" aria-selected="true" type="button">Agendamentos</button>
+        <button class="tab" id="tab-robo" data-aba="robo" role="tab" aria-selected="false" type="button">Robô (WhatsApp)</button>
+      </div>
+
+      <div id="aba-agendamentos" role="tabpanel">
       <div class="secao-titulo">
-        <h2>Agendamentos de hoje</h2>
+        <h2>Agendamentos</h2>
         <span id="agendamentos-total"></span>
       </div>
 
@@ -336,17 +375,21 @@
         <table>
           <thead>
             <tr>
+              <th scope="col">Data</th>
               <th scope="col">Horário</th>
               <th scope="col">Cliente</th>
               <th scope="col">Serviço</th>
+              <th scope="col">WhatsApp</th>
             </tr>
           </thead>
           <tbody id="agendamentos-corpo">
-            <tr><td class="carregando" colspan="3">Carregando agendamentos...</td></tr>
+            <tr><td class="carregando" colspan="5">Carregando agendamentos...</td></tr>
           </tbody>
         </table>
       </div>
+      </div>
 
+      <div id="aba-robo" role="tabpanel" class="hidden">
       <div class="secao-titulo">
         <h2>Conexão do Robô</h2>
         <span id="wa-status" class="badge">Desconectado</span>
@@ -355,7 +398,16 @@
       <div class="wa-box">
         <p id="wa-texto" class="wa-texto">Conecte um número de WhatsApp para ativar o robô.</p>
         <img id="wa-qr" class="wa-qr hidden" alt="QR Code para conectar o WhatsApp" />
-        <button class="btn" id="btn-wa" type="button">Conectar WhatsApp</button>
+        <a
+          class="btn btn-link"
+          id="btn-qr-externo"
+          href="https://robo-atendimento-yjxb.onrender.com/qrcode"
+          target="_blank"
+          rel="noopener noreferrer"
+        >Abrir QR Code do robô</a>
+        <button class="btn btn-ghost" id="btn-wa" type="button">Conectar WhatsApp</button>
+      </div>
+
       </div>
 
       <button class="btn btn-ghost" id="btn-sair" type="button">Sair</button>
@@ -513,17 +565,59 @@
       }
 
       await carregarAgendamentos();
+      if (localStorage.getItem(TOKEN_KEY)) iniciarAtualizacaoAgendamentos();
     }
+
+    // Atualiza a tabela sozinha para os agendamentos feitos pelo robô aparecerem no painel
+    const AGENDAMENTOS_INTERVALO_MS = 15000;
+    let agendamentosIntervalo = null;
+
+    function pararAtualizacaoAgendamentos() {
+      clearInterval(agendamentosIntervalo);
+      agendamentosIntervalo = null;
+    }
+
+    function iniciarAtualizacaoAgendamentos() {
+      pararAtualizacaoAgendamentos();
+      agendamentosIntervalo = setInterval(() => {
+        const abaVisivel = !$('aba-agendamentos').classList.contains('hidden');
+        if (abaVisivel && !document.hidden) carregarAgendamentos(true);
+      }, AGENDAMENTOS_INTERVALO_MS);
+    }
+
+    // ---------- Abas do painel ----------
+    function mudarAba(nome, atualizar = true) {
+      ['agendamentos', 'robo'].forEach((aba) => {
+        const ativa = aba === nome;
+        $(`aba-${aba}`).classList.toggle('hidden', !ativa);
+        const botao = $(`tab-${aba}`);
+        botao.classList.toggle('ativa', ativa);
+        botao.setAttribute('aria-selected', String(ativa));
+      });
+      if (nome === 'agendamentos' && atualizar) carregarAgendamentos(true);
+    }
+
+    document.querySelectorAll('.tab').forEach((botao) => {
+      botao.addEventListener('click', () => mudarAba(botao.dataset.aba));
+    });
 
     // ---------- Agendamentos ----------
     function linhaMensagem(classe, texto) {
       const tr = document.createElement('tr');
       const td = document.createElement('td');
-      td.colSpan = 3;
+      td.colSpan = 5;
       td.className = classe;
       td.textContent = texto;
       tr.appendChild(td);
       return tr;
+    }
+
+    function formatarData(iso) {
+      return iso ? iso.split('-').reverse().join('/') : '—';
+    }
+
+    function formatarContato(numero) {
+      return numero ? `+${numero}` : '—';
     }
 
     function renderizarAgendamentos(lista) {
@@ -538,12 +632,16 @@
         return;
       }
 
+      const hoje = new Date().toLocaleDateString('en-CA'); // AAAA-MM-DD no fuso do navegador
       lista.forEach((item) => {
         const tr = document.createElement('tr');
+        if (item.data < hoje) tr.className = 'passado';
         [
+          ['', formatarData(item.data)],
           ['horario', item.horario],
           ['', item.cliente],
           ['', item.servico],
+          ['', formatarContato(item.contato)],
         ].forEach(([classe, valor]) => {
           const td = document.createElement('td');
           if (classe) td.className = classe;
@@ -554,10 +652,12 @@
       });
     }
 
-    async function carregarAgendamentos() {
+    async function carregarAgendamentos(silencioso = false) {
       const corpo = $('agendamentos-corpo');
-      corpo.replaceChildren(linhaMensagem('carregando', 'Carregando agendamentos...'));
-      $('agendamentos-total').textContent = '';
+      if (!silencioso) {
+        corpo.replaceChildren(linhaMensagem('carregando', 'Carregando agendamentos...'));
+        $('agendamentos-total').textContent = '';
+      }
 
       try {
         const lista = await requisitar(`${API}/agendamentos`, {
@@ -570,13 +670,15 @@
           mostrarMensagem('login-msg', err.message);
           return;
         }
-        corpo.replaceChildren(linhaMensagem('erro-tabela', err.message));
+        if (!silencioso) corpo.replaceChildren(linhaMensagem('erro-tabela', err.message));
       }
     }
 
     function sair() {
       localStorage.removeItem(TOKEN_KEY);
       resetarWhatsApp();
+      pararAtualizacaoAgendamentos();
+      mudarAba('agendamentos', false);
       mostrarTela('login');
     }
 
