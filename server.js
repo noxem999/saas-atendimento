@@ -202,6 +202,8 @@ app.post('/api/registrar', limitarTentativas, async (req, res) => {
       senhaHash: await bcrypt.hash(String(senha), SALT_ROUNDS),
       role: 'cliente',
       ativo: true,
+      status: 'ativo', // assinatura: 'ativo' | 'inativo' (pausado)
+      dataVencimento: null, // AAAA-MM-DD; vazio = sem vencimento
       empresa: { nome: '', info: '' },
       criadoEm: new Date().toISOString(),
       ultimoLoginEm: null,
@@ -280,14 +282,31 @@ function agoraNoBrasil() {
 
 const dataParaBR = (iso) => iso.split('-').reverse().join('/');
 
+// Valida AAAA-MM-DD (sem estourar em datas impossíveis, como 2026-13-45)
+function dataIsoValida(texto) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(texto)) return false;
+  const d = new Date(`${texto}T00:00:00Z`);
+  return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === texto;
+}
+
+// Assinatura do cliente: "inativo" (pausado) ou data de vencimento anterior a hoje => robô suspenso.
+// dataVencimento vazia = sem vencimento. O dia do vencimento ainda vale; suspende a partir do dia seguinte.
+function situacaoAssinatura(usuario) {
+  if (usuario.role === 'admin') return { ok: true, estado: 'ativa' };
+  if ((usuario.status || 'ativo') === 'inativo') return { ok: false, estado: 'pausada' };
+  if (usuario.dataVencimento && usuario.dataVencimento < agoraNoBrasil().data) {
+    return { ok: false, estado: 'vencida' };
+  }
+  return { ok: true, estado: 'ativa' };
+}
+
 function criarAgendamento(usuario, jid, dados) {
   const cliente = String(dados?.nome || '').trim().slice(0, 80);
   const servico = String(dados?.servico || '').trim().slice(0, 80);
   const data = String(dados?.data || '').trim();
   const horario = String(dados?.horario || '').trim();
 
-  const dataValida =
-    /^\d{4}-\d{2}-\d{2}$/.test(data) && new Date(`${data}T00:00:00Z`).toISOString().slice(0, 10) === data;
+  const dataValida = dataIsoValida(data);
   const horarioValido = /^([01]\d|2[0-3]):[0-5]\d$/.test(horario);
 
   if (!cliente || !servico || !dataValida || !horarioValido) {
@@ -480,6 +499,24 @@ let versaoBaileys = null;
 const dirSessao = (usuarioId) => path.join(AUTH_ROOT, `usuario-${usuarioId}`);
 const temCredenciais = (usuarioId) => fs.existsSync(path.join(dirSessao(usuarioId), 'creds.json'));
 
+// Mensagem enviada ao cliente final quando a assinatura está pausada ou vencida
+const MENSAGEM_SUSPENSO =
+  process.env.MENSAGEM_SUSPENSO ||
+  'Olá! O atendimento automático desta empresa está temporariamente suspenso. Tente novamente mais tarde ou entre em contato por outro canal.';
+
+// O aviso vai no máximo 1 vez a cada 6 horas por contato: evita spam e loop com outros robôs
+const avisosSuspensao = new Map(); // `${usuarioId}:${jid}` -> horário do último aviso
+const INTERVALO_AVISO_MS = 6 * 60 * 60 * 1000;
+
+async function avisarSuspensao(usuarioId, sock, jid) {
+  const chave = `${usuarioId}:${jid}`;
+  if (Date.now() - (avisosSuspensao.get(chave) || 0) < INTERVALO_AVISO_MS) return;
+
+  if (avisosSuspensao.size >= 5000) avisosSuspensao.delete(avisosSuspensao.keys().next().value);
+  avisosSuspensao.set(chave, Date.now());
+  await sock.sendMessage(jid, { text: MENSAGEM_SUSPENSO });
+}
+
 async function tratarMensagens(usuarioId, sock, { messages, type }) {
   const usuario = buscarUsuario(usuarioId);
   if (!usuario || !usuario.ativo) return;
@@ -515,6 +552,14 @@ async function tratarMensagens(usuarioId, sock, { messages, type }) {
       const texto = conteudo.conversation || conteudo.extendedTextMessage?.text;
       if (!texto || !texto.trim()) {
         console.log(`[bot ${usuarioId}] ignorado (${jid}): não é texto (${Object.keys(conteudo).join(', ')}).`);
+        continue;
+      }
+
+      // Assinatura pausada ou vencida: NÃO responde com a IA, só avisa que o serviço está suspenso
+      const assinatura = situacaoAssinatura(usuario);
+      if (!assinatura.ok) {
+        console.log(`[bot ${usuarioId}] assinatura ${assinatura.estado}: IA não respondeu a ${jid}.`);
+        await avisarSuspensao(usuarioId, sock, jid);
         continue;
       }
 
@@ -701,6 +746,9 @@ app.get('/api/admin/usuarios', autenticar, somenteAdmin, (req, res) => {
     ultimoLoginEm: u.ultimoLoginEm || null,
     whatsapp: sessoes.get(u.id)?.conectado ? 'conectado' : 'desconectado',
     agendamentos: db.agendamentos.filter((a) => a.usuarioId === u.id).length,
+    status: u.status || 'ativo',
+    dataVencimento: u.dataVencimento || null,
+    assinatura: situacaoAssinatura(u).estado, // 'ativa' | 'pausada' | 'vencida'
   }));
   res.json(lista);
 });
@@ -721,6 +769,45 @@ app.patch('/api/admin/usuarios/:id', autenticar, somenteAdmin, async (req, res) 
   }
 
   res.json({ mensagem: alvo.ativo ? 'Conta liberada.' : 'Conta bloqueada.', ativo: alvo.ativo });
+});
+
+// Pausar/reativar cliente e definir o vencimento. O cliente continua entrando no painel;
+// só o robô é suspenso (o WhatsApp dele segue conectado para poder enviar o aviso de suspensão).
+app.patch('/api/admin/usuarios/:id/assinatura', autenticar, somenteAdmin, (req, res) => {
+  const alvo = buscarUsuario(Number(req.params.id));
+  if (!alvo) return res.status(404).json({ erro: 'Usuário não encontrado.' });
+  if (alvo.role === 'admin') return res.status(400).json({ erro: 'Administradores não têm assinatura.' });
+
+  const { status, dataVencimento } = req.body || {};
+  let mensagem = 'Assinatura atualizada.';
+
+  if (status !== undefined) {
+    if (!['ativo', 'inativo'].includes(status)) {
+      return res.status(400).json({ erro: 'Status inválido. Use "ativo" ou "inativo".' });
+    }
+    alvo.status = status;
+    mensagem = status === 'inativo' ? 'Cliente pausado. O robô não responde mais.' : 'Cliente reativado.';
+  }
+
+  if (dataVencimento !== undefined) {
+    if (dataVencimento === null || dataVencimento === '') {
+      alvo.dataVencimento = null;
+      mensagem = 'Vencimento removido.';
+    } else if (dataIsoValida(String(dataVencimento))) {
+      alvo.dataVencimento = String(dataVencimento);
+      mensagem = `Vencimento definido para ${dataParaBR(alvo.dataVencimento)}.`;
+    } else {
+      return res.status(400).json({ erro: 'Data inválida. Use o formato AAAA-MM-DD.' });
+    }
+  }
+
+  salvarDados();
+  res.json({
+    mensagem,
+    status: alvo.status || 'ativo',
+    dataVencimento: alvo.dataVencimento || null,
+    assinatura: situacaoAssinatura(alvo).estado,
+  });
 });
 
 app.post('/api/admin/usuarios/:id/senha', autenticar, somenteAdmin, async (req, res) => {
