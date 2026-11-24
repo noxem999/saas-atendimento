@@ -306,7 +306,7 @@
     }
 
     /* Administração */
-    .acoes { display: flex; gap: 6px; }
+    .acoes { display: flex; flex-wrap: wrap; gap: 6px; min-width: 200px; }
     .btn-mini {
       padding: 6px 10px;
       border: 1px solid var(--line);
@@ -493,12 +493,13 @@
                 <th scope="col">Cadastro</th>
                 <th scope="col">WhatsApp</th>
                 <th scope="col">Agend.</th>
+                <th scope="col">Vence em</th>
                 <th scope="col">Status</th>
                 <th scope="col">Ações</th>
               </tr>
             </thead>
             <tbody id="admin-corpo">
-              <tr><td class="carregando" colspan="7">Carregando contas...</td></tr>
+              <tr><td class="carregando" colspan="8">Carregando contas...</td></tr>
             </tbody>
           </table>
         </div>
@@ -858,6 +859,19 @@
       }
     }
 
+    function rotuloStatus(u) {
+      if (u.role === 'admin') return 'Admin';
+      if (!u.ativo) return 'Bloqueada';
+      if (u.assinatura === 'pausada') return 'Pausada';
+      if (u.assinatura === 'vencida') return 'Vencida';
+      return 'Ativa';
+    }
+
+    function classeStatus(u) {
+      if (u.role === 'admin') return 'status-neutro';
+      return u.ativo && u.assinatura === 'ativa' ? 'status-ok' : 'status-off';
+    }
+
     function renderizarUsuarios(lista) {
       const corpo = $('admin-corpo');
       corpo.replaceChildren();
@@ -876,7 +890,8 @@
           celula(new Date(u.criadoEm).toLocaleDateString('pt-BR')),
           celula(u.whatsapp === 'conectado' ? '● Conectado' : '○ Desconectado', u.whatsapp === 'conectado' ? 'status-ok' : 'status-neutro'),
           celula(String(u.agendamentos)),
-          celula(eAdmin ? 'Admin' : u.ativo ? 'Ativa' : 'Bloqueada', eAdmin ? 'status-neutro' : u.ativo ? 'status-ok' : 'status-off')
+          celula(u.dataVencimento ? formatarData(u.dataVencimento) : '—', u.assinatura === 'vencida' ? 'status-off' : 'status-neutro'),
+          celula(rotuloStatus(u), classeStatus(u))
         );
 
         const acoes = document.createElement('td');
@@ -892,6 +907,39 @@
               executarAcaoAdmin(`${API}/admin/usuarios/${u.id}`, {
                 method: 'PATCH',
                 body: JSON.stringify({ ativo: !u.ativo }),
+              });
+            }),
+            botaoAcao(u.status === 'inativo' ? 'Reativar cliente' : 'Pausar cliente', false, () => {
+              const pausando = u.status !== 'inativo';
+              const pergunta = pausando
+                ? `Pausar ${u.email}? O robô deixa de responder e envia um aviso de serviço suspenso aos clientes dela.`
+                : `Reativar ${u.email}? O robô volta a responder.`;
+              if (!confirm(pergunta)) return;
+              executarAcaoAdmin(`${API}/admin/usuarios/${u.id}/assinatura`, {
+                method: 'PATCH',
+                body: JSON.stringify({ status: pausando ? 'inativo' : 'ativo' }),
+              });
+            }),
+            botaoAcao('Vencimento', false, () => {
+              const atual = u.dataVencimento ? formatarData(u.dataVencimento) : '';
+              const entrada = prompt(
+                `Vencimento da assinatura de ${u.email} (DD/MM/AAAA). Deixe em branco para remover:`,
+                atual
+              );
+              if (entrada === null) return; // cancelou
+              let iso = null;
+              const texto = entrada.trim();
+              if (texto) {
+                const m = texto.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+                if (!m) {
+                  mostrarMensagem('admin-msg', 'Use o formato DD/MM/AAAA.');
+                  return;
+                }
+                iso = `${m[3]}-${m[2]}-${m[1]}`;
+              }
+              executarAcaoAdmin(`${API}/admin/usuarios/${u.id}/assinatura`, {
+                method: 'PATCH',
+                body: JSON.stringify({ dataVencimento: iso }),
               });
             }),
             botaoAcao('Senha', false, () => {
